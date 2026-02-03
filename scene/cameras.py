@@ -13,14 +13,15 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-from utils.general_utils import PILtoTorch
-import cv2
+import math
+
 
 class Camera(nn.Module):
-    def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, depth_params, image, gt_alpha_mask,
                  image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
-                 train_test_exp = False, is_test_dataset = False, is_test_view = False
+                 train_test_exp = False, is_test_dataset = False, scene_scale = 1.0,
+                 depth_image=None
                  ):
         super(Camera, self).__init__()
 
@@ -30,6 +31,7 @@ class Camera(nn.Module):
         self.T = T
         self.FoVx = FoVx
         self.FoVy = FoVy
+        self.depth_params = depth_params
         self.image_name = image_name
 
         try:
@@ -39,43 +41,18 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        resized_image_rgb = PILtoTorch(image, resolution)
-        gt_image = resized_image_rgb[:3, ...]
-        self.alpha_mask = None
-        if resized_image_rgb.shape[0] == 4:
-            self.alpha_mask = resized_image_rgb[3:4, ...].to(self.data_device)
-        else: 
-            self.alpha_mask = torch.ones_like(resized_image_rgb[0:1, ...].to(self.data_device))
-
-        if train_test_exp and is_test_view:
-            if is_test_dataset:
-                self.alpha_mask[..., :self.alpha_mask.shape[-1] // 2] = 0
-            else:
-                self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
-
-        self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
+        if isinstance(image, torch.Tensor):
+            resized_image_rgb = image if image.shape[0] == 3 else image.permute(2, 0, 1)
+        else:
+            resized_image_rgb = torch.from_numpy(image).permute(2, 0, 1)
+        self.original_image = resized_image_rgb.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
 
-        self.invdepthmap = None
-        self.depth_reliable = False
-        if invdepthmap is not None:
-            self.depth_mask = torch.ones_like(self.alpha_mask)
-            self.invdepthmap = cv2.resize(invdepthmap, resolution)
-            self.invdepthmap[self.invdepthmap < 0] = 0
-            self.depth_reliable = True
-
-            if depth_params is not None:
-                if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
-                    self.depth_reliable = False
-                    self.depth_mask *= 0
-                
-                if depth_params["scale"] > 0:
-                    self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
-
-            if self.invdepthmap.ndim != 2:
-                self.invdepthmap = self.invdepthmap[..., 0]
-            self.invdepthmap = torch.from_numpy(self.invdepthmap[None]).to(self.data_device)
+        if gt_alpha_mask is not None:
+            self.original_image *= gt_alpha_mask.to(self.data_device)
+        else:
+            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
 
         self.zfar = 100.0
         self.znear = 0.01
@@ -87,9 +64,180 @@ class Camera(nn.Module):
         self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        if train_test_exp:
+            self.exposure = nn.Parameter(torch.tensor([0.0, 0.0, 0.0], device=self.data_device, requires_grad=True))
+        else:
+            self.exposure = None
+
+        self.is_test_dataset = is_test_dataset
+        self.scene_scale = scene_scale
+
+        if depth_image is not None:
+            self.depth_image = torch.from_numpy(depth_image).to(self.data_device)
+        else:
+            self.depth_image = None
+
+
+class FisheyeCamera(nn.Module):
+    """
+    Fisheye 카메라 클래스
+    - Fisheye GT 이미지를 저장
+    - Cubemap 렌더링 후 Fisheye로 변환하여 비교
+    """
+    def __init__(self, colmap_id, R, T, fov, fisheye_params, image, gt_alpha_mask,
+                 image_name, uid,
+                 trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device="cuda",
+                 train_test_exp=False, is_test_dataset=False, scene_scale=1.0,
+                 depth_image=None):
+        super(FisheyeCamera, self).__init__()
+
+        self.uid = uid
+        self.colmap_id = colmap_id
+        self.R = R
+        self.T = T
+        self.fov = fov  # Fisheye FOV (e.g., 180.0)
+        self.fisheye_params = fisheye_params  # Distortion parameters
+        self.image_name = image_name
+
+        try:
+            self.data_device = torch.device(data_device)
+        except Exception as e:
+            print(e)
+            print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device")
+            self.data_device = torch.device("cuda")
+
+        # Fisheye GT 이미지
+        if isinstance(image, torch.Tensor):
+            resized_image_rgb = image if image.shape[0] == 3 else image.permute(2, 0, 1)
+        else:
+            resized_image_rgb = torch.from_numpy(image).permute(2, 0, 1)
+        self.original_image = resized_image_rgb.clamp(0.0, 1.0).to(self.data_device)
+        self.image_width = self.original_image.shape[2]
+        self.image_height = self.original_image.shape[1]
+
+        if gt_alpha_mask is not None:
+            self.original_image *= gt_alpha_mask.to(self.data_device)
+        else:
+            self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+
+        self.zfar = 100.0
+        self.znear = 0.01
+
+        self.trans = trans
+        self.scale = scale
+
+        # World view transform (fisheye 카메라 위치)
+        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
+        self.camera_center = self.world_view_transform.inverse()[3, :3]
+
+        # Exposure compensation
+        if train_test_exp:
+            self.exposure = nn.Parameter(torch.tensor([0.0, 0.0, 0.0], device=self.data_device, requires_grad=True))
+        else:
+            self.exposure = None
+
+        self.is_test_dataset = is_test_dataset
+        self.scene_scale = scene_scale
+
+        if depth_image is not None:
+            self.depth_image = torch.from_numpy(depth_image).to(self.data_device)
+        else:
+            self.depth_image = None
+
+        # Cubemap 카메라들 생성 (6개 방향)
+        self.cubemap_cameras = self.create_cubemap_cameras()
         
+        
+        
+    
+
+    def create_cubemap_cameras(self):
+        """
+        Fisheye 카메라 위치에서 6개 방향의 Cubemap 카메라 생성
+        
+        Returns:
+            list of Camera: 6개의 Pinhole 카메라 [+X, -X, +Y, -Y, +Z, -Z]
+        """
+        cubemap_cameras = []
+        
+        # Cubemap face size (정사각형)
+        # Fisheye 이미지 크기를 기반으로 적절한 크기 설정
+        face_size = 1024
+        
+        # 90도 FOV (cubemap은 각 face가 90도)
+        fov = math.pi / 2.0  # 90 degrees in radians
+        
+        # Cubemap 6개 방향의 회전 행렬
+        # Order: [+X(right), -X(left), +Y(up), -Y(down), +Z(front), -Z(back)]
+        rotations = [
+            # +X (right): 왼쪽으로 90도 회전
+            np.array([[0, 0, 1],
+                     [0, 1, 0],
+                     [-1, 0, 0]]),
+            
+            # -X (left): 오른쪽으로 90도 회전
+            np.array([[0, 0, -1],
+                     [0, 1, 0],
+                     [1, 0, 0]]),
+            
+            # +Y (up): 위로 90도 회전
+            np.array([[1, 0, 0],
+                     [0, 0, -1],
+                     [0, 1, 0]]),
+            
+            # -Y (down): 아래로 90도 회전
+            np.array([[1, 0, 0],
+                     [0, 0, 1],
+                     [0, -1, 0]]),
+            
+            # +Z (front): 그대로
+            np.array([[1, 0, 0],
+                     [0, 1, 0],
+                     [0, 0, 1]]),
+            
+            # -Z (back): 180도 회전
+            np.array([[-1, 0, 0],
+                     [0, 1, 0],
+                     [0, 0, -1]]),
+        ]
+        
+        face_names = ['right', 'left', 'up', 'down', 'front', 'back']
+        
+        for i, (rot, name) in enumerate(zip(rotations, face_names)):
+            # Fisheye 카메라의 회전에 Cubemap 방향 회전 적용
+            R_cubemap = self.R @ rot
+            
+            # Dummy image (실제로는 렌더링될 예정)
+            dummy_image = np.zeros((face_size, face_size, 3))
+            
+            # Cubemap 카메라 생성
+            cam = Camera(
+                colmap_id=self.colmap_id * 10 + i,  # Unique ID
+                R=R_cubemap,
+                T=self.T,
+                FoVx=fov,
+                FoVy=fov,
+                depth_params={},
+                image=dummy_image,
+                gt_alpha_mask=None,
+                image_name=f"{self.image_name}_cubemap_{name}",
+                uid=self.uid * 10 + i,
+                trans=self.trans,
+                scale=self.scale,
+                data_device="cpu",
+                train_test_exp=False,
+                is_test_dataset=self.is_test_dataset,
+                scene_scale=self.scene_scale
+            )
+            
+            cubemap_cameras.append(cam)
+        
+        return cubemap_cameras
+
+
 class MiniCam:
-    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform):
+    def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform, camera_center):
         self.image_width = width
         self.image_height = height    
         self.FoVy = fovy
@@ -98,6 +246,4 @@ class MiniCam:
         self.zfar = zfar
         self.world_view_transform = world_view_transform
         self.full_proj_transform = full_proj_transform
-        view_inv = torch.inverse(self.world_view_transform)
-        self.camera_center = view_inv[3][:3]
-
+        self.camera_center = camera_center

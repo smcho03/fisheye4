@@ -23,19 +23,23 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 
+
 class CameraInfo(NamedTuple):
     uid: int
     R: np.array
     T: np.array
     FovY: np.array
     FovX: np.array
-    depth_params: dict
+    image: np.array
     image_path: str
     image_name: str
-    depth_path: str
     width: int
     height: int
-    is_test: bool
+    depth_params: dict
+    is_fisheye: bool = False
+    fisheye_params: dict = None
+    depth_image: np.array = None
+
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -43,10 +47,15 @@ class SceneInfo(NamedTuple):
     test_cameras: list
     nerf_normalization: dict
     ply_path: str
-    is_nerf_synthetic: bool
+
 
 def getNerfppNorm(cam_info):
     def get_center_and_diag(cam_centers):
+        # 추가: 빈 리스트 체크
+        if len(cam_centers) == 0:
+            print("Warning: No cameras found!")
+            return np.array([0., 0., 0.]), 1.0
+        
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
         center = avg_cam_center
@@ -60,6 +69,11 @@ def getNerfppNorm(cam_info):
         W2C = getWorld2View2(cam.R, cam.T)
         C2W = np.linalg.inv(W2C)
         cam_centers.append(C2W[:3, 3:4])
+    
+    # 추가: 빈 리스트 체크
+    if len(cam_centers) == 0:
+        print("Warning: No camera centers collected!")
+        return {"translate": np.array([0., 0., 0.]), "radius": 1.0}
 
     center, diagonal = get_center_and_diag(cam_centers)
     radius = diagonal * 1.1
@@ -68,11 +82,11 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, depths_folder=None):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
-        # the exact output you're looking for:
         sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
         sys.stdout.flush()
 
@@ -97,25 +111,119 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
-        n_remove = len(extr.name.split('.')[-1]) + 1
-        depth_params = None
-        if depths_params is not None:
-            try:
-                depth_params = depths_params[extr.name[:-n_remove]]
-            except:
-                print("\n", key, "not found in depths_params")
+        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_name = os.path.basename(image_path).split(".")[0]
+        image = Image.open(image_path)
 
-        image_path = os.path.join(images_folder, extr.name)
-        image_name = extr.name
-        depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
+        depth_params = {}
+        depth_image = None
+        if depths_folder is not None:
+            depth_image_path = os.path.join(depths_folder, os.path.basename(extr.name))
+            if os.path.exists(depth_image_path):
+                depth_image = np.array(Image.open(depth_image_path))
+                
+                depth_params_path = os.path.join(depths_folder, "depth_params.json")
+                if os.path.exists(depth_params_path):
+                    with open(depth_params_path, 'r') as f:
+                        all_depth_params = json.load(f)
+                        depth_params = all_depth_params.get(image_name, {})
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              depth_params=depth_params, depth_image=depth_image)
         cam_infos.append(cam_info)
-
     sys.stdout.write('\n')
     return cam_infos
+
+
+def readFisheyeCameras(fisheye_json_path, images_folder, depths_folder=None):
+    """
+    Fisheye 카메라 정보를 JSON 파일에서 읽기
+    
+    JSON 포맷 예시:
+    {
+        "cameras": [
+            {
+                "image_name": "image_001.jpg",
+                "R": [[...], [...], [...]],  # 3x3 rotation matrix
+                "T": [x, y, z],  # translation vector
+                "fov": 180.0,  # field of view in degrees
+                "width": 1024,
+                "height": 1024,
+                "fisheye_params": {
+                    "distortion_model": "equidistant",
+                    "k1": 0.0, "k2": 0.0, "k3": 0.0, "k4": 0.0  # optional distortion params
+                }
+            },
+            ...
+        ]
+    }
+    """
+    cam_infos = []
+    
+    with open(fisheye_json_path, 'r') as f:
+        data = json.load(f)
+    
+    cameras = data.get("cameras", [])
+    
+    for idx, cam_data in enumerate(cameras):
+        sys.stdout.write('\r')
+        sys.stdout.write("Reading fisheye camera {}/{}".format(idx+1, len(cameras)))
+        sys.stdout.flush()
+        
+        image_name = cam_data["image_name"]
+        R = np.array(cam_data["R"])
+        T = np.array(cam_data["T"])
+        fov = cam_data.get("fov", 180.0)
+        width = cam_data["width"]
+        height = cam_data["height"]
+        fisheye_params = cam_data.get("fisheye_params", {})
+        
+        # Load image
+        image_path = os.path.join(images_folder, image_name)
+        if not os.path.exists(image_path):
+            print(f"\nWarning: Image not found: {image_path}")
+            continue
+        
+        image = Image.open(image_path)
+        
+        # Load depth if available
+        depth_params = {}
+        depth_image = None
+        if depths_folder is not None:
+            depth_image_path = os.path.join(depths_folder, image_name)
+            if os.path.exists(depth_image_path):
+                depth_image = np.array(Image.open(depth_image_path))
+                
+                depth_params_path = os.path.join(depths_folder, "depth_params.json")
+                if os.path.exists(depth_params_path):
+                    with open(depth_params_path, 'r') as f:
+                        all_depth_params = json.load(f)
+                        img_name_no_ext = os.path.splitext(image_name)[0]
+                        depth_params = all_depth_params.get(img_name_no_ext, {})
+        
+        # Fisheye는 FovX, FovY 대신 fov 하나만 사용
+        cam_info = CameraInfo(
+            uid=idx,
+            R=R,
+            T=T,
+            FovY=np.deg2rad(fov),  # Convert to radians
+            FovX=np.deg2rad(fov),
+            image=image,
+            image_path=image_path,
+            image_name=os.path.splitext(image_name)[0],
+            width=width,
+            height=height,
+            depth_params=depth_params,
+            is_fisheye=True,
+            fisheye_params=fisheye_params,
+            depth_image=depth_image
+        )
+        cam_infos.append(cam_info)
+    
+    sys.stdout.write('\n')
+    return cam_infos
+
 
 def fetchPly(path):
     plydata = PlyData.read(path)
@@ -124,6 +232,7 @@ def fetchPly(path):
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -142,7 +251,8 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+
+def readColmapSceneInfo(path, images, eval, depths=None, llffhold=8):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -154,51 +264,23 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    depth_params_file = os.path.join(path, "sparse/0", "depth_params.json")
-    ## if depth_params_file isnt there AND depths file is here -> throw error
-    depths_params = None
-    if depths != "":
-        try:
-            with open(depth_params_file, "r") as f:
-                depths_params = json.load(f)
-            all_scales = np.array([depths_params[key]["scale"] for key in depths_params])
-            if (all_scales > 0).sum():
-                med_scale = np.median(all_scales[all_scales > 0])
-            else:
-                med_scale = 0
-            for key in depths_params:
-                depths_params[key]["med_scale"] = med_scale
-
-        except FileNotFoundError:
-            print(f"Error: depth_params.json file not found at path '{depth_params_file}'.")
-            sys.exit(1)
-        except Exception as e:
-            print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
-            sys.exit(1)
-
-    if eval:
-        if "360" in path:
-            llffhold = 8
-        if llffhold:
-            print("------------LLFF HOLD-------------")
-            cam_names = [cam_extrinsics[cam_id].name for cam_id in cam_extrinsics]
-            cam_names = sorted(cam_names)
-            test_cam_names_list = [name for idx, name in enumerate(cam_names) if idx % llffhold == 0]
-        else:
-            with open(os.path.join(path, "sparse/0", "test.txt"), 'r') as file:
-                test_cam_names_list = [line.strip() for line in file]
-    else:
-        test_cam_names_list = []
-
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(
-        cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
-        images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+    
+    depths_folder = None
+    if depths is not None:
+        depths_folder = os.path.join(path, depths)
+    
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, 
+                                           images_folder=os.path.join(path, reading_dir),
+                                           depths_folder=depths_folder)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
-    train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
-    test_cam_infos = [c for c in cam_infos if c.is_test]
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
@@ -221,62 +303,81 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           is_nerf_synthetic=False)
+                           ply_path=ply_path)
     return scene_info
 
-def readCamerasFromTransforms(path, transformsfile, depths_folder, white_background, is_test, extension=".png"):
-    cam_infos = []
 
-    with open(os.path.join(path, transformsfile)) as json_file:
-        contents = json.load(json_file)
-        fovx = contents["camera_angle_x"]
+def readFisheyeSceneInfo(path, images, eval, fisheye_json="fisheye_cameras.json", depths=None, llffhold=8):
+    """
+    Fisheye 데이터셋 읽기
+    
+    디렉토리 구조:
+    path/
+    ├── fisheye_cameras.json  # Fisheye 카메라 정보
+    ├── images/               # Fisheye 이미지들
+    ├── depths/               # (Optional) Depth 이미지들
+    └── sparse/0/             # COLMAP SfM 결과 (초기 point cloud용)
+    """
+    reading_dir = "images" if images == None else images
+    images_folder = os.path.join(path, reading_dir)
+    
+    depths_folder = None
+    if depths is not None:
+        depths_folder = os.path.join(path, depths)
+    
+    # Fisheye 카메라 정보 읽기
+    fisheye_json_path = os.path.join(path, fisheye_json)
+    if not os.path.exists(fisheye_json_path):
+        raise FileNotFoundError(f"Fisheye camera info not found: {fisheye_json_path}")
+    
+    cam_infos = readFisheyeCameras(fisheye_json_path, images_folder, depths_folder)
+    
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
 
-        frames = contents["frames"]
-        for idx, frame in enumerate(frames):
-            cam_name = os.path.join(path, frame["file_path"] + extension)
+    nerf_normalization = getNerfppNorm(train_cam_infos)
 
-            # NeRF 'transform_matrix' is a camera-to-world transform
-            c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
+    # Point cloud는 COLMAP 결과 사용 (또는 별도 제공)
+    ply_path = os.path.join(path, "sparse/0/points3D.ply")
+    bin_path = os.path.join(path, "sparse/0/points3D.bin")
+    txt_path = os.path.join(path, "sparse/0/points3D.txt")
+    
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            try:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            except:
+                # Fallback: random point cloud
+                print("Warning: No point cloud found, using random initialization")
+                xyz = np.random.random((100, 3)) * 10 - 5
+                rgb = np.random.random((100, 3))
+        storePly(ply_path, xyz, rgb)
+    
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
 
-            # get the world-to-camera transform and set R, T
-            w2c = np.linalg.inv(c2w)
-            R = np.transpose(w2c[:3,:3])  # R is stored transposed due to 'glm' in CUDA code
-            T = w2c[:3, 3]
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
 
-            image_path = os.path.join(path, cam_name)
-            image_name = Path(cam_name).stem
-            image = Image.open(image_path)
 
-            im_data = np.array(image.convert("RGBA"))
-
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
-            FovY = fovy 
-            FovX = fovx
-
-            depth_path = os.path.join(depths_folder, f"{image_name}.png") if depths_folder != "" else ""
-
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
-                            image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
-            
-    return cam_infos
-
-def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"):
-
-    depths_folder=os.path.join(path, depths) if depths != "" else ""
+def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     print("Reading Training Transforms")
-    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", depths_folder, white_background, False, extension)
+    train_cam_infos = readCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
-    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", depths_folder, white_background, True, extension)
+    test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
     
     if not eval:
         train_cam_infos.extend(test_cam_infos)
@@ -305,11 +406,51 @@ def readNerfSyntheticInfo(path, white_background, depths, eval, extension=".png"
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path,
-                           is_nerf_synthetic=True)
+                           ply_path=ply_path)
     return scene_info
+
+
+def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
+    cam_infos = []
+
+    with open(os.path.join(path, transformsfile)) as json_file:
+        contents = json.load(json_file)
+        fovx = contents["camera_angle_x"]
+
+        frames = contents["frames"]
+        for idx, frame in enumerate(frames):
+            cam_name = os.path.join(path, frame["file_path"] + extension)
+
+            matrix = np.linalg.inv(np.array(frame["transform_matrix"]))
+            R = -np.transpose(matrix[:3,:3])
+            R[:,0] = -R[:,0]
+            T = -matrix[:3, 3]
+
+            image_path = os.path.join(path, cam_name)
+            image_name = Path(cam_name).stem
+            image = Image.open(image_path)
+
+            im_data = np.array(image.convert("RGBA"))
+
+            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+
+            norm_data = im_data / 255.0
+            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+
+            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            FovY = fovy 
+            FovX = fovx
+
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1],
+                            depth_params={}))
+            
+    return cam_infos
+
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "Fisheye": readFisheyeSceneInfo  # 새로 추가!
 }
