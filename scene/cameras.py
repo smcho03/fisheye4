@@ -155,65 +155,75 @@ class FisheyeCamera(nn.Module):
     def create_cubemap_cameras(self):
         """
         Fisheye 카메라 위치에서 6개 방향의 Cubemap 카메라 생성
-        
-        Returns:
-            list of Camera: 6개의 Pinhole 카메라 [+X, -X, +Y, -Y, +Z, -Z]
+        Cubemap face order: [+X, -X, +Y, -Y, +Z, -Z]
+        +Z is the forward direction (where fisheye center looks)
         """
         cubemap_cameras = []
         
-        # Cubemap face size (정사각형)
-        # Fisheye 이미지 크기를 기반으로 적절한 크기 설정
-        face_size = 1024
+        # Cubemap face size
+        face_size = 720
         
-        # 90도 FOV (cubemap은 각 face가 90도)
-        fov = math.pi / 2.0  # 90 degrees in radians
+        # 90도 FOV
+        fov = math.pi / 2.0
         
-        # Cubemap 6개 방향의 회전 행렬
-        # Order: [+X(right), -X(left), +Y(up), -Y(down), +Z(front), -Z(back)]
-        rotations = [
-            # +X (right): 왼쪽으로 90도 회전
-            np.array([[0, 0, 1],
-                     [0, 1, 0],
-                     [-1, 0, 0]]),
-            
-            # -X (left): 오른쪽으로 90도 회전
-            np.array([[0, 0, -1],
-                     [0, 1, 0],
-                     [1, 0, 0]]),
-            
-            # +Y (up): 위로 90도 회전
-            np.array([[1, 0, 0],
-                     [0, 0, -1],
-                     [0, 1, 0]]),
-            
-            # -Y (down): 아래로 90도 회전
-            np.array([[1, 0, 0],
-                     [0, 0, 1],
-                     [0, -1, 0]]),
-            
-            # +Z (front): 그대로
-            np.array([[1, 0, 0],
-                     [0, 1, 0],
-                     [0, 0, 1]]),
-            
-            # -Z (back): 180도 회전
-            np.array([[-1, 0, 0],
-                     [0, 1, 0],
-                     [0, 0, -1]]),
-        ]
+        # Cubemap 방향별 회전 행렬
+        # 기본 카메라가 +Z를 바라본다고 가정
+        # 각 face를 렌더링하기 위해 카메라를 회전
         
-        face_names = ['right', 'left', 'up', 'down', 'front', 'back']
+        # +X: 오른쪽을 보려면 Y축 기준 -90도 회전
+        R_pos_x = np.array([
+            [0, 0, 1],
+            [0, 1, 0],
+            [-1, 0, 0]
+        ], dtype=np.float64)
+        
+        # -X: 왼쪽을 보려면 Y축 기준 +90도 회전
+        R_neg_x = np.array([
+            [0, 0, -1],
+            [0, 1, 0],
+            [1, 0, 0]
+        ], dtype=np.float64)
+        
+        # +Y: 위를 보려면 X축 기준 -90도 회전
+        R_pos_y = np.array([
+            [1, 0, 0],
+            [0, 0, 1],
+            [0, -1, 0]
+        ], dtype=np.float64)
+        
+        # -Y: 아래를 보려면 X축 기준 +90도 회전
+        R_neg_y = np.array([
+            [1, 0, 0],
+            [0, 0, -1],
+            [0, 1, 0]
+        ], dtype=np.float64)
+        
+        # +Z: 앞 (기본 방향) - 단위 행렬
+        R_pos_z = np.array([
+            [1, 0, 0],
+            [0, 1, 0],
+            [0, 0, 1]
+        ], dtype=np.float64)
+        
+        # -Z: 뒤를 보려면 Y축 기준 180도 회전
+        R_neg_z = np.array([
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, 0, -1]
+        ], dtype=np.float64)
+        
+        rotations = [R_pos_x, R_neg_x, R_pos_y, R_neg_y, R_pos_z, R_neg_z]
+        face_names = ['pos_x', 'neg_x', 'pos_y', 'neg_y', 'pos_z', 'neg_z']
         
         for i, (rot, name) in enumerate(zip(rotations, face_names)):
-            # Fisheye 카메라의 회전에 Cubemap 방향 회전 적용
+            # Fisheye 카메라의 회전에 cubemap 방향 회전 적용
             R_cubemap = self.R @ rot
             
-            # Dummy image (실제로는 렌더링될 예정)
-            dummy_image = np.zeros((face_size, face_size, 3))
+            # Dummy image
+            dummy_image = np.zeros((face_size, face_size, 3), dtype=np.float32)
             
-            # Cubemap 카메라 생성
             cam = Camera(
-                colmap_id=self.colmap_id * 10 + i,  # Unique ID
+                colmap_id=self.colmap_id * 10 + i,
                 R=R_cubemap,
                 T=self.T,
                 FoVx=fov,
@@ -225,7 +235,7 @@ class FisheyeCamera(nn.Module):
                 uid=self.uid * 10 + i,
                 trans=self.trans,
                 scale=self.scale,
-                data_device="cpu",
+                data_device="cuda",
                 train_test_exp=False,
                 is_test_dataset=self.is_test_dataset,
                 scene_scale=self.scene_scale

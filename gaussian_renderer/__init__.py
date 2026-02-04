@@ -201,9 +201,7 @@ def render_fisheye(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Te
 def render_fisheye_optimized(viewpoint_camera, pc: GaussianModel, pipe, bg_color: torch.Tensor,
                              scaling_modifier=1.0, override_color=None, mapping_cache=None):
     """
-    최적화된 Fisheye 렌더링 (visibility 정보 포함)
-    
-    각 cubemap face의 visibility와 radii를 통합하여 반환
+    최적화된 Fisheye 렌더링
     """
     from scene.cameras import FisheyeCamera
     
@@ -211,18 +209,18 @@ def render_fisheye_optimized(viewpoint_camera, pc: GaussianModel, pipe, bg_color
         raise ValueError("render_fisheye_optimized requires FisheyeCamera instance")
     
     cubemap_faces = []
-    all_screenspace_points = []
     all_visibility_filters = []
     all_radii = []
+    all_viewspace_points = []
     
-    # 6개 방향 각각 렌더링하며 정보 수집
-    for i, cam in enumerate(viewpoint_camera.cubemap_cameras):
+    # 6개 방향 렌더링
+    for cam in viewpoint_camera.cubemap_cameras:
         result = render(cam, pc, pipe, bg_color, scaling_modifier, override_color)
         
         cubemap_faces.append(result["render"])
-        all_screenspace_points.append(result["viewspace_points"])
         all_visibility_filters.append(result["visibility_filter"])
         all_radii.append(result["radii"])
+        all_viewspace_points.append(result["viewspace_points"])
     
     # Cubemap → Fisheye 변환
     fisheye_image = cubemap_to_fisheye(
@@ -233,23 +231,20 @@ def render_fisheye_optimized(viewpoint_camera, pc: GaussianModel, pipe, bg_color
         mapping_cache=mapping_cache
     )
     
-    # Visibility filter 통합: 하나라도 visible이면 True
-    combined_visibility = all_visibility_filters[0]
-    for vis in all_visibility_filters[1:]:
-        combined_visibility = combined_visibility | vis
+    # Visibility와 radii 통합 (OR 연산 / max)
+    combined_visibility = all_visibility_filters[0].clone()
+    combined_radii = all_radii[0].clone()
     
-    # Radii 통합: 최댓값 사용
-    combined_radii = all_radii[0]
-    for rad in all_radii[1:]:
-        combined_radii = torch.maximum(combined_radii, rad)
+    for i in range(1, 6):
+        combined_visibility = combined_visibility | all_visibility_filters[i]
+        combined_radii = torch.maximum(combined_radii, all_radii[i])
     
-    # Screenspace points: 평균 사용 (또는 첫 번째 것 사용)
-    combined_screenspace = all_screenspace_points[0]
+    # Viewspace points는 front face (+Z) 것을 사용
+    primary_viewspace_points = all_viewspace_points[4]  # +Z face
     
     return {
         "render": fisheye_image,
-        "viewspace_points": combined_screenspace,
+        "viewspace_points": primary_viewspace_points,
         "visibility_filter": combined_visibility,
         "radii": combined_radii,
-        "cubemap_faces": cubemap_faces  # Debugging용
     }

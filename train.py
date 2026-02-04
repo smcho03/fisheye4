@@ -24,6 +24,7 @@ from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.cubemap_to_fisheye import create_mapping_cache
+import torchvision
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -247,6 +248,10 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
                             tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
+                    if idx == 0:  # 첫 번째 이미지만 저장
+                        render_path = os.path.join(args.model_path, config['name'], f"iter_{iteration}")
+                        os.makedirs(render_path, exist_ok=True)
+                        torchvision.utils.save_image(image, os.path.join(render_path, '000.png'))
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])

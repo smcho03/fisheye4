@@ -68,16 +68,20 @@ def colmap_to_fisheye_json(colmap_path, images_folder, output_json="fisheye_came
         
         # Camera dict
         cam_dict = {
-            "image_name": image_name,
-            "R": R.tolist(),
-            "T": T.tolist(),
-            "fov": fov,
-            "width": width,
-            "height": height,
-            "fisheye_params": {
-                "distortion_model": "equidistant"
-            }
-        }
+        "image_name": image_name,
+        "R": R.tolist(),
+        "T": T.tolist(),
+        "fov": fov,
+        "width": width,
+        "height": height,
+        "fisheye_params": {
+        "distortion_model": "equidistant",
+        "k1": intr.params[4] if len(intr.params) > 4 else 0.0,
+        "k2": intr.params[5] if len(intr.params) > 5 else 0.0,
+        "k3": intr.params[6] if len(intr.params) > 6 else 0.0,
+        "k4": intr.params[7] if len(intr.params) > 7 else 0.0
+    }
+}
         
         cameras.append(cam_dict)
         print(f"  [{idx+1}/{len(cam_extrinsics)}] {image_name}")
